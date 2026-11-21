@@ -50,4 +50,4 @@ python3 scripts/compare.py out dev-answer
 python3 reference/reference.py DATA_DIR ref_out   # writes CSVs in the fixtures' expected format
 ```
 
-Results so far: 36/36 fixtures, an exact match with the dev answer (117,038 `user_daily` and 27,400 `campaign_daily` rows), and an exact match with `reference.py` on every random generator seed tried. Measured on 8 threads (Linux, warm cache, a 2010-era Xeon): about 2.3 s for 20M events, peaking at about 3.4 GB RSS.
+Results so far: 36/36 fixtures, an exact match with the dev answer (117,038 `user_daily` and 27,400 `campaign_daily` rows), and an exact match with `reference.py` on every random generator seed tried. Measured on 8 threads (warm cache, a 2010-era Xeon): about 1.8–2.0 s for 20M events on Linux, peaking at about 3.4 GB RSS; about 15 s for 60M events (5.4 GB of CSV) on the Windows build, peaking at 8.7 GB.

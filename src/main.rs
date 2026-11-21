@@ -127,7 +127,7 @@ fn read_table(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
     let data = std::fs::read(path).unwrap_or_default();
     let mut out = Vec::new();
     if let Some(nl) = data.iter().position(|&c| c == b'\n') {
-        csv::for_each_line::<2, _>(&data[nl + 1..], |f| out.push((f[0].to_vec(), f[1].to_vec())));
+        csv::for_each_line_fast::<2, _>(&data[nl + 1..], |f| out.push((f[0].to_vec(), f[1].to_vec())));
     }
     out
 }
@@ -193,7 +193,7 @@ impl Ctx {
 
 fn parse_events(buf: &[u8], ctx: &Ctx, cands: &mut [BlockList<Cand>], arena: &mut Arena) {
     let (w0, w1, base) = (ctx.w0, ctx.w1, ctx.base);
-    csv::for_each_line::<7, _>(buf, |f| {
+    csv::for_each_line_fast::<7, _>(buf, |f| {
         let e = f[0];
         if e.is_empty() {
             return;
@@ -240,7 +240,7 @@ fn parse_clicks(buf: &[u8], ctx: &Ctx, out: &mut Vec<ClickRaw>) {
     let lo = ctx.w0 - REACH_MS;
     let hi = ctx.w1;
     let base = ctx.base;
-    csv::for_each_line::<4, _>(buf, |f| {
+    csv::for_each_line_fast::<4, _>(buf, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -262,7 +262,7 @@ fn parse_clicks(buf: &[u8], ctx: &Ctx, out: &mut Vec<ClickRaw>) {
 }
 
 fn parse_links(buf: &[u8], ctx: &Ctx, out: &mut Vec<(u64, u64)>) {
-    csv::for_each_line::<2, _>(buf, |f| {
+    csv::for_each_line_fast::<2, _>(buf, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -587,6 +587,11 @@ fn populate(buf: &[u8]) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = buf;
+}
+
+#[inline]
+pub fn memchr_nl(s: &[u8]) -> Option<usize> {
+    memchr(b'\n', s)
 }
 
 #[inline]
