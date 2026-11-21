@@ -7,6 +7,10 @@ edition = "2021"
 name = "shopping-sessions"
 path = "src/main.rs"
 
+[features]
+# Development-only sampling profiler, see src/prof.rs.
+prof = []
+
 [dependencies]
 memmap2 = "0.9"
 
