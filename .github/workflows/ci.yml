@@ -1,0 +1,43 @@
+# Builds the submission image exactly as the scorer does (root Dockerfile,
+# linux/amd64) and runs all 36 fixtures through it with the scorer's container
+# flags: read-only root, no network, UID 1000, 64 MB /tmp, read-only /data.
+# GitHub's runners have AVX2, so this also exercises the x86-64-v3 binary.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CPU features
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          grep -m1 -o -w avx2 /proc/cpuinfo || { echo "::error::runner has no AVX2, the v3 binary cannot be tested here"; exit 1; }
+          nproc; free -g
+
+      - name: Build image (linux/amd64)
+        run: |
+          start=$(date +%s)
+          docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+          echo "build took $(( $(date +%s) - start )) s (limit 600 s)"
+          docker image ls shopping-sessions:latest
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install fixture checker
+        run: pip install polars==2.1.0
+
+      - name: Run 36 fixtures in the container
+        env:
+          CPUS: "4"
+          MEM: "12g"
+        run: python scripts/run_fixtures.py fixtures -- sh scripts/docker_run.sh

@@ -1,0 +1,8 @@
+target/
+reference/
+scripts/
+fixtures/
+.github/
+*.sh
+*.md
+.git
