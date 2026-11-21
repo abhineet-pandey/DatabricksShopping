@@ -1,6 +1,7 @@
 //! Shopping Sessions: native pipeline. See README.md for the design.
 
 mod alloc;
+mod arena;
 mod csv;
 mod ids;
 mod parquet;
@@ -11,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use arena::{Arena, BlockList};
 use ids::{Interner, Names};
 use memmap2::Mmap;
-use timeparse::{parse_iso, parse_price, parse_ts, DAY_MS};
+use timeparse::{fast_iso, fast_ts, parse_price, DAY_MS};
 
 #[global_allocator]
 static GLOBAL: alloc::HugeAlloc = alloc::HugeAlloc;
@@ -177,7 +179,7 @@ impl Ctx {
 
 // ---------------------------------------------------------------- parsing
 
-fn parse_events(buf: &[u8], ctx: &Ctx, cands: &mut [Vec<Cand>], single: bool) {
+fn parse_events(buf: &[u8], ctx: &Ctx, cands: &mut [BlockList<Cand>], arena: &mut Arena) {
     let (w0, w1, base) = (ctx.w0, ctx.w1, ctx.base);
     csv::for_each_line::<7, _>(buf, |f| {
         let e = f[0];
@@ -186,13 +188,13 @@ fn parse_events(buf: &[u8], ctx: &Ctx, cands: &mut [Vec<Cand>], single: bool) {
         }
         let eid = ctx.interner.code(e);
         let mut c = Cand { eid, user: 0, ingest: u32::MAX, ts: 0, pc: 0, valid: 0 };
-        if let Some(ing) = parse_iso(f[3]) {
+        if let Some(ing) = fast_iso(f[3]) {
             c.ingest = ctx.ingest_key(ing);
             'v: {
                 if f[1].is_empty() || f[5].is_empty() {
                     break 'v;
                 }
-                let ts = match parse_ts(f[2]) {
+                let ts = match fast_ts(f[2]) {
                     Some(t) if t >= w0 && t < w1 => t,
                     _ => break 'v,
                 };
@@ -218,8 +220,7 @@ fn parse_events(buf: &[u8], ctx: &Ctx, cands: &mut [Vec<Cand>], single: bool) {
                 c.valid = 1;
             }
         }
-        let b = if single { 0 } else { hp(eid, ctx.pbits) };
-        unsafe { cands.get_unchecked_mut(b) }.push(c);
+        unsafe { cands.get_unchecked_mut(hp(eid, ctx.pbits)) }.push(arena, c);
     });
 }
 
@@ -235,7 +236,7 @@ fn parse_clicks(buf: &[u8], ctx: &Ctx, out: &mut Vec<ClickRaw>) {
             Some(c) => c,
             None => return,
         };
-        let ts = match parse_ts(f[3]) {
+        let ts = match fast_ts(f[3]) {
             Some(t) if t >= lo && t < hi => t,
             _ => return,
         };
@@ -583,8 +584,8 @@ fn ev_ts(k: u64) -> i64 {
 
 fn process_partition(
     q: usize,
-    ev_parts: &[Vec<Vec<Ev>>],
-    cl_parts: &[Vec<Vec<Cl>>],
+    ev_parts: &[Vec<BlockList<Ev>>],
+    cl_parts: &[Vec<BlockList<Cl>>],
     s: &mut Scratch,
     agg: &Agg,
     names: &Names,
@@ -621,7 +622,7 @@ fn process_partition(
         }
     };
     for p in ev_parts {
-        for e in &p[q] {
+        for e in p[q].iter() {
             let id = lookup_insert(&mut s.table, &mut s.persons, &mut s.ecount, e.person);
             s.ecount[id] += 1;
         }
@@ -640,7 +641,7 @@ fn process_partition(
         // reuse ecount as cursor
         let mut cur: Vec<u32> = s.eoff[..np].to_vec();
         for p in ev_parts {
-            for e in &p[q] {
+            for e in p[q].iter() {
                 let mut i = hl(e.person, bits);
                 let id = loop {
                     let t = unsafe { s.table.get_unchecked(i) };
@@ -673,7 +674,7 @@ fn process_partition(
     };
     let mut nc = 0usize;
     for p in cl_parts {
-        for c in &p[q] {
+        for c in p[q].iter() {
             if let Some(id) = find(&s.table, c.person) {
                 s.ccount[id] += 1;
                 nc += 1;
@@ -692,7 +693,7 @@ fn process_partition(
     if nc > 0 {
         let mut cur: Vec<u32> = s.coff[..np].to_vec();
         for p in cl_parts {
-            for c in &p[q] {
+            for c in p[q].iter() {
                 if let Some(id) = find(&s.table, c.person) {
                     let at = cur[id];
                     cur[id] = at + 1;
@@ -980,7 +981,6 @@ fn main() {
     make_chunks(&mut input, &list_csv(&data_dir.join("events")), 1, &mut work_chunks);
     make_chunks(&mut input, &list_csv(&data_dir.join("clicks")), 2, &mut work_chunks);
     // larger chunks first is not needed: chunks are similar in size
-    let event_bytes: usize = work_chunks.iter().filter(|c| c.kind == 1).map(|c| c.end - c.start).sum();
     timer.mark("setup");
 
     // ---- phase 1: links
@@ -998,9 +998,7 @@ fn main() {
 
     // ---- phase 2: events + clicks (thread 0 builds the link map first)
     let next = AtomicUsize::new(0);
-    let est_per_bucket = event_bytes / 70 / threads / nparts + 16;
     let mut linkmap: Option<LinkMap> = None;
-    let mode: u32 = std::env::var("SS_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let pre = std::sync::Mutex::new(Some(prepare_links(&links, threads)));
     timer.mark("link table prepared");
     let serial_links = std::env::var("SS_SERIAL_LINKS").is_ok();
@@ -1008,7 +1006,7 @@ fn main() {
         linkmap = Some(finish_links(pre.lock().unwrap().take().unwrap(), &links, &ctx.interner));
         timer.mark("link map built (serial)");
     }
-    let parsed: Vec<(Vec<Vec<Cand>>, Vec<ClickRaw>, Option<LinkMap>)> = run_parallel(threads, |t| {
+    let parsed: Vec<(Vec<BlockList<Cand>>, Arena, Vec<ClickRaw>, Option<LinkMap>)> = run_parallel(threads, |t| {
         let lm = if t == 0 && !serial_links {
             let p = pre.lock().unwrap().take().unwrap();
             let m = finish_links(p, &links, &ctx.interner);
@@ -1017,38 +1015,27 @@ fn main() {
         } else {
             None
         };
-        let mut cands: Vec<Vec<Cand>> = (0..nparts).map(|_| Vec::with_capacity(est_per_bucket)).collect();
+        let mut arena = Arena::new();
+        let mut cands: Vec<BlockList<Cand>> = (0..nparts).map(|_| BlockList::new()).collect();
         let mut clicks: Vec<ClickRaw> = Vec::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(c) = work_chunks.get(i) else { break };
             let buf = &input.maps[c.file as usize][c.start..c.end];
-            if mode == 4 {
-                std::hint::black_box(csv::count_structural(buf));
-            } else if mode == 5 {
-                std::hint::black_box(buf.iter().map(|&b| b as usize).sum::<usize>());
-            } else if mode == 1 {
-                let mut n = 0usize;
-                csv::for_each_line::<7, _>(buf, |f| n += f[0].len());
-                std::hint::black_box(n);
-            } else if mode == 2 && c.kind == 1 {
-                parse_events(buf, &ctx, &mut cands, true);
-                cands[0].clear();
-            } else if mode == 3 && c.kind == 1 {
-                parse_events(buf, &ctx, &mut cands, false);
-                for b in cands.iter_mut() { b.clear(); }
-            } else if c.kind == 1 {
-                parse_events(buf, &ctx, &mut cands, false);
+            if c.kind == 1 {
+                parse_events(buf, &ctx, &mut cands, &mut arena);
             } else {
                 parse_clicks(buf, &ctx, &mut clicks);
             }
         }
-        (cands, clicks, lm)
+        (cands, arena, clicks, lm)
     });
-    let mut cand_parts: Vec<Vec<Vec<Cand>>> = Vec::with_capacity(threads);
+    let mut cand_parts: Vec<Vec<BlockList<Cand>>> = Vec::with_capacity(threads);
+    let mut cand_arenas: Vec<Arena> = Vec::with_capacity(threads);
     let mut click_raw: Vec<Vec<ClickRaw>> = Vec::with_capacity(threads);
-    for (c, k, lm) in parsed {
+    for (c, a, k, lm) in parsed {
         cand_parts.push(c);
+        cand_arenas.push(a);
         click_raw.push(k);
         if lm.is_some() {
             linkmap = lm;
@@ -1075,21 +1062,21 @@ fn main() {
     };
     let next = AtomicUsize::new(0);
     let total_tasks = nparts + click_blocks.len();
-    let per_q_est = event_bytes / 75 / threads / nq + 16;
     let dbg = timer.on;
-    let routed: Vec<(Vec<Vec<Ev>>, Vec<Vec<Cl>>)> = run_parallel(threads, |tid| {
+    let routed: Vec<(Vec<BlockList<Ev>>, Vec<BlockList<Cl>>, Arena)> = run_parallel(threads, |tid| {
         let (mut t_ins, mut t_emit, mut t_clk) = (0f64, 0f64, 0f64);
-        let mut evp: Vec<Vec<Ev>> = (0..nq).map(|_| Vec::with_capacity(per_q_est)).collect();
-        let mut clp: Vec<Vec<Cl>> = (0..nq).map(|_| Vec::new()).collect();
-        let mut table: Vec<(u64, u32, u32)> = Vec::new();
+        let mut arena = Arena::new();
+        let mut evp: Vec<BlockList<Ev>> = (0..nq).map(|_| BlockList::new()).collect();
+        let mut clp: Vec<BlockList<Cl>> = (0..nq).map(|_| BlockList::new()).collect();
+        let mut table: Vec<(u64, *const Cand)> = Vec::new();
         let mut batch: Vec<(u64, u64)> = Vec::with_capacity(64);
-        let flush = |batch: &mut Vec<(u64, u64)>, evp: &mut Vec<Vec<Ev>>| {
+        let flush = |batch: &mut Vec<(u64, u64)>, evp: &mut Vec<BlockList<Ev>>, arena: &mut Arena| {
             for &(u, _) in batch.iter() {
                 prefetch(&linkmap.slots[linkmap.slot_of(u)]);
             }
             for &(u, key) in batch.iter() {
                 let person = linkmap.get(u);
-                evp[hp(person, qbits)].push(Ev { person, key });
+                unsafe { evp.get_unchecked_mut(hp(person, qbits)) }.push(arena, Ev { person, key });
             }
             batch.clear();
         };
@@ -1109,21 +1096,19 @@ fn main() {
                 let size = 1usize << bits;
                 let mask = size - 1;
                 table.clear();
-                table.resize(size, (0, 0, 0));
-                for (t, p) in cand_parts.iter().enumerate() {
-                    for (i, c) in p[b].iter().enumerate() {
+                table.resize(size, (0, std::ptr::null()));
+                for p in cand_parts.iter() {
+                    for c in p[b].iter() {
                         let mut h = hl(c.eid, bits);
                         loop {
                             let e = unsafe { table.get_unchecked_mut(h) };
                             if e.0 == 0 {
-                                *e = (c.eid, t as u32, i as u32);
+                                *e = (c.eid, c as *const Cand);
                                 break;
                             }
                             if e.0 == c.eid {
-                                let cur = &cand_parts[e.1 as usize][b][e.2 as usize];
-                                if c.ingest < cur.ingest {
-                                    e.1 = t as u32;
-                                    e.2 = i as u32;
+                                if c.ingest < unsafe { (*e.1).ingest } {
+                                    e.1 = c as *const Cand;
                                 }
                                 break;
                             }
@@ -1133,20 +1118,31 @@ fn main() {
                 }
                 let tq2 = Instant::now();
                 t_ins += (tq2 - tq).as_secs_f64();
-                for e in &table {
-                    if e.0 == 0 {
-                        continue;
-                    }
-                    let c = &cand_parts[e.1 as usize][b][e.2 as usize];
-                    if c.valid == 0 {
-                        continue;
-                    }
-                    batch.push((c.user, ((c.ts as u64) << 32) | c.pc as u64));
-                    if batch.len() == 32 {
-                        flush(&mut batch, &mut evp);
+                // Walk the candidates in order; a valid one is emitted when the
+                // table names it as its event's kept copy.
+                for p in cand_parts.iter() {
+                    for c in p[b].iter() {
+                        if c.valid == 0 {
+                            continue;
+                        }
+                        let mut h = hl(c.eid, bits);
+                        let kept = loop {
+                            let e = unsafe { table.get_unchecked(h) };
+                            if e.0 == c.eid {
+                                break e.1;
+                            }
+                            h = (h + 1) & mask;
+                        };
+                        if kept != c as *const Cand {
+                            continue;
+                        }
+                        batch.push((c.user, ((c.ts as u64) << 32) | c.pc as u64));
+                        if batch.len() == 32 {
+                            flush(&mut batch, &mut evp, &mut arena);
+                        }
                     }
                 }
-                flush(&mut batch, &mut evp);
+                flush(&mut batch, &mut evp, &mut arena);
                 t_emit += tq2.elapsed().as_secs_f64();
             } else {
                 let tq = Instant::now();
@@ -1158,7 +1154,7 @@ fn main() {
                         prefetch(&linkmap.slots[linkmap.slot_of(u)]);
                     }
                     let person = linkmap.get(c.user);
-                    clp[hp(person, qbits)].push(Cl {
+                    unsafe { clp.get_unchecked_mut(hp(person, qbits)) }.push(&mut arena, Cl {
                         person,
                         kid: c.kid,
                         key: ((c.ts as u64) << 32) | c.camp as u64,
@@ -1170,15 +1166,18 @@ fn main() {
         if dbg && tid < 2 {
             eprintln!("  t{tid}: dedup insert {:.0} ms, emit+lookup {:.0} ms, clicks {:.0} ms", t_ins*1e3, t_emit*1e3, t_clk*1e3);
         }
-        (evp, clp)
+        (evp, clp, arena)
     });
     drop(cand_parts);
+    drop(cand_arenas);
     drop(click_raw);
     let mut ev_parts = Vec::with_capacity(threads);
     let mut cl_parts = Vec::with_capacity(threads);
-    for (e, c) in routed {
+    let mut route_arenas = Vec::with_capacity(threads);
+    for (e, c, a) in routed {
         ev_parts.push(e);
         cl_parts.push(c);
+        route_arenas.push(a);
     }
     timer.mark("dedup+route");
 
@@ -1231,6 +1230,7 @@ fn main() {
     });
     drop(ev_parts);
     drop(cl_parts);
+    drop(route_arenas);
     timer.mark("sessions");
 
     // ---- phase 5: write

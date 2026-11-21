@@ -16,6 +16,7 @@ everything from the mounted input on every run.
 | `src/ids.rs` | Exact, order-preserving integer codes for IDs, with interning as the fallback |
 | `src/parquet.rs` | Minimal Parquet writer for the two output tables (`day` as `DATE`) |
 | `src/alloc.rs` | Allocator that requests transparent huge pages for large blocks |
+| `src/arena.rs` | Per-thread bump arena and block lists for the bucket scatters, so buckets get huge pages |
 | `reference/reference.py` | Slow, independent Python reference used for differential testing. Shares no code with the binary |
 | `fixtures/` | The 36 official edge-case fixtures |
 | `scripts/` | Fixture runner, scorer-flags `docker_run.sh`, and output comparer (from the starter kit) |
@@ -49,4 +50,4 @@ python3 scripts/compare.py out dev-answer
 python3 reference/reference.py DATA_DIR ref_out   # writes CSVs in the fixtures' expected format
 ```
 
-Results so far: 36/36 fixtures, an exact match with the dev answer (117,038 `user_daily` and 27,400 `campaign_daily` rows), and an exact match with `reference.py` on every random generator seed tried. Measured on 8 threads (Linux, warm cache): about 2.0 s for 5M events and about 3.5 s for 20M events, peaking at about 3.3 GB RSS.
+Results so far: 36/36 fixtures, an exact match with the dev answer (117,038 `user_daily` and 27,400 `campaign_daily` rows), and an exact match with `reference.py` on every random generator seed tried. Measured on 8 threads (Linux, warm cache, a 2010-era Xeon): about 2.3 s for 20M events, peaking at about 3.4 GB RSS.
