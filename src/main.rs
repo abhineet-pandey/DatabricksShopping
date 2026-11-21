@@ -15,7 +15,6 @@ use std::time::Instant;
 
 use arena::{Arena, BlockList};
 use ids::{Interner, Names};
-use memmap2::Mmap;
 use timeparse::{fast_iso, fast_ts, parse_price, DAY_MS};
 
 #[global_allocator]
@@ -23,7 +22,7 @@ static GLOBAL: alloc::HugeAlloc = alloc::HugeAlloc;
 
 const GAP_MS: i64 = 1_800_000;
 const REACH_MS: i64 = 604_800_000;
-const CHUNK: usize = 4 << 20;
+const CHUNK: usize = 1 << 20;
 
 // ---------------------------------------------------------------- hashing
 
@@ -510,7 +509,7 @@ fn finish_links(pre: LinkPre, links: &[Vec<(u64, u64)>], names: &Interner) -> Li
 // ---------------------------------------------------------------- files
 
 struct Input {
-    maps: Vec<Mmap>,
+    files: Vec<(std::fs::File, usize)>,
 }
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -526,6 +525,7 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// A byte range of one file. The lines that start inside it belong to it.
 #[derive(Clone, Copy)]
 struct Chunk {
     file: u32,
@@ -534,7 +534,7 @@ struct Chunk {
     end: usize,
 }
 
-fn make_chunks(input: &mut Input, paths: &[PathBuf], kind: u8, out: &mut Vec<Chunk>) {
+fn make_chunks(input: &mut Input, paths: &[PathBuf], kind: u8, chunk: usize, out: &mut Vec<Chunk>) {
     for p in paths {
         let f = match std::fs::File::open(p) {
             Ok(f) => f,
@@ -544,54 +544,75 @@ fn make_chunks(input: &mut Input, paths: &[PathBuf], kind: u8, out: &mut Vec<Chu
         if len == 0 {
             continue;
         }
-        let m = if std::env::var("SS_POPULATE").is_ok() {
-            unsafe { memmap2::MmapOptions::new().populate().map(&f) }.expect("mmap")
-        } else {
-            unsafe { Mmap::map(&f) }.expect("mmap")
-        };
-        let fi = input.maps.len() as u32;
-        let data: &[u8] = &m;
-        // skip header line
-        let mut start = match memchr(b'\n', data) {
-            Some(i) => i + 1,
-            None => {
-                input.maps.push(m);
-                continue;
-            }
-        };
+        let fi = input.files.len() as u32;
+        input.files.push((f, len));
+        let mut start = 0;
         while start < len {
-            let mut end = (start + CHUNK).min(len);
-            if end < len {
-                end = match memchr(b'\n', &data[end..]) {
-                    Some(i) => end + i + 1,
-                    None => len,
-                };
-            }
+            let end = (start + chunk).min(len);
             out.push(Chunk { file: fi, kind, start, end });
             start = end;
         }
-        input.maps.push(m);
     }
 }
 
-/// Maps a chunk's pages in one call (Linux 5.14+) instead of one fault per
-/// page while parsing. Harmless where unsupported.
-fn populate(buf: &[u8]) {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        const MADV_POPULATE_READ: libc::c_int = 22;
-        let page = 4096usize;
-        let start = buf.as_ptr() as usize & !(page - 1);
-        let end = buf.as_ptr() as usize + buf.len();
-        libc::madvise(start as *mut libc::c_void, end - start, MADV_POPULATE_READ);
+/// Reads up to `n` bytes at `off`, appending to `buf`; returns the count.
+fn read_at(f: &std::fs::File, off: usize, n: usize, buf: &mut Vec<u8>) -> usize {
+    let old = buf.len();
+    buf.reserve(n + 64);
+    unsafe { buf.set_len(old + n) };
+    let mut got = 0;
+    while got < n {
+        #[cfg(unix)]
+        let r = std::os::unix::fs::FileExt::read_at(f, &mut buf[old + got..old + n], (off + got) as u64);
+        #[cfg(windows)]
+        let r = std::os::windows::fs::FileExt::seek_read(f, &mut buf[old + got..old + n], (off + got) as u64);
+        match r {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => panic!("read: {e}"),
+        }
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = buf;
+    unsafe { buf.set_len(old + got) };
+    got
 }
 
-#[inline]
-pub fn memchr_nl(s: &[u8]) -> Option<usize> {
-    memchr(b'\n', s)
+/// Loads the whole lines that start in `c` into `buf` and returns them. The
+/// header (the file's first line) never belongs to a chunk.
+fn load_chunk<'b>(input: &Input, c: &Chunk, buf: &'b mut Vec<u8>) -> &'b [u8] {
+    let (f, len) = &input.files[c.file as usize];
+    let from = c.start.saturating_sub(1);
+    buf.clear();
+    read_at(f, from, c.end - from, buf);
+    // first line start at or after c.start: just after the first '\n' at or
+    // after c.start - 1 (for c.start == 0 that skips the header)
+    let begin = match memchr(b'\n', buf) {
+        Some(i) => i + 1,
+        None => return &[],
+    };
+    if from + begin >= c.end {
+        return &[];
+    }
+    // extend to the end of the line that starts last
+    if buf.last() != Some(&b'\n') {
+        let mut at = c.end;
+        loop {
+            if at >= *len {
+                break;
+            }
+            let k = buf.len();
+            let got = read_at(f, at, 1 << 16, buf);
+            if got == 0 {
+                break;
+            }
+            at += got;
+            if let Some(i) = memchr(b'\n', &buf[k..]) {
+                buf.truncate(k + i + 1);
+                break;
+            }
+        }
+    }
+    &buf[begin..]
 }
 
 #[inline]
@@ -1038,12 +1059,13 @@ fn main() {
     };
 
     // ---- files
-    let mut input = Input { maps: Vec::new() };
+    let chunk: usize = std::env::var("SS_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(CHUNK);
+    let mut input = Input { files: Vec::new() };
     let mut link_chunks = Vec::new();
-    make_chunks(&mut input, &list_csv(&data_dir.join("links")), 0, &mut link_chunks);
+    make_chunks(&mut input, &list_csv(&data_dir.join("links")), 0, chunk, &mut link_chunks);
     let mut work_chunks = Vec::new();
-    make_chunks(&mut input, &list_csv(&data_dir.join("events")), 1, &mut work_chunks);
-    make_chunks(&mut input, &list_csv(&data_dir.join("clicks")), 2, &mut work_chunks);
+    make_chunks(&mut input, &list_csv(&data_dir.join("events")), 1, chunk, &mut work_chunks);
+    make_chunks(&mut input, &list_csv(&data_dir.join("clicks")), 2, chunk, &mut work_chunks);
     // larger chunks first is not needed: chunks are similar in size
     timer.mark("setup");
 
@@ -1051,10 +1073,11 @@ fn main() {
     let next = AtomicUsize::new(0);
     let links: Vec<Vec<(u64, u64)>> = run_parallel(threads, |_| {
         let mut out = Vec::new();
+        let mut buf = Vec::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(c) = link_chunks.get(i) else { break };
-            parse_links(&input.maps[c.file as usize][c.start..c.end], &ctx, &mut out);
+            parse_links(load_chunk(&input, c, &mut buf), &ctx, &mut out);
         }
         out
     });
@@ -1080,11 +1103,11 @@ fn main() {
         let mut carena = Arena::new();
         let mut clp: Vec<BlockList<Cl>> = (0..nq).map(|_| BlockList::new()).collect();
         let mut clicks: Vec<ClickRaw> = Vec::new();
+        let mut cbuf: Vec<u8> = Vec::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(c) = work_chunks.get(i) else { break };
-            let buf = &input.maps[c.file as usize][c.start..c.end];
-            populate(buf);
+            let buf = load_chunk(&input, c, &mut cbuf);
             if c.kind == 1 {
                 parse_events(buf, &ctx, &mut cands, &mut arena);
             } else {
