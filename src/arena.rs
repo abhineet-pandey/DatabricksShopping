@@ -183,7 +183,15 @@ impl<T: Copy> BlockList<T> {
         }
         unsafe {
             let dst = self.cur.add(self.fill) as *mut u8;
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                use std::arch::x86_64::*;
+                let src = self.stage.as_ptr() as *const __m256i;
+                let d = dst as *mut __m256i;
+                _mm256_stream_si256(d, _mm256_load_si256(src));
+                _mm256_stream_si256(d.add(1), _mm256_load_si256(src.add(1)));
+            }
+            #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
             {
                 use std::arch::x86_64::*;
                 let src = self.stage.as_ptr() as *const __m128i;
