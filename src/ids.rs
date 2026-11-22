@@ -322,19 +322,17 @@ impl LongNames {
             }
         }
     }
-    #[inline]
-    pub fn bytes_of(&self, code: u64, out: &mut Vec<u8>) {
-        if code & FALLBACK == 0 {
-            decode_fast(code, out);
-        } else {
-            out.extend_from_slice(self.table.get(code).expect("long ID without its string"));
-        }
-    }
+}
+
+/// Strings behind codes: fast codes decode, long codes are looked up.
+pub trait IdNames {
+    fn long_str(&self, code: u64) -> Option<&[u8]>;
+
     /// The string behind `code`; fast codes are decoded into `buf`.
     #[inline]
     fn str_of<'a>(&'a self, code: u64, buf: &'a mut [u8; 12]) -> &'a [u8] {
         if code & FALLBACK != 0 {
-            return self.table.get(code).expect("long ID without its string");
+            return self.long_str(code).expect("long ID without its string");
         }
         let mut c = code;
         let mut d = [0u8; 12];
@@ -349,14 +347,61 @@ impl LongNames {
         }
         &buf[..n]
     }
+    #[inline]
+    fn bytes_of(&self, code: u64, out: &mut Vec<u8>) {
+        let mut b = [0u8; 12];
+        out.extend_from_slice(self.str_of(code, &mut b));
+    }
     /// Byte-wise comparison of the strings behind two codes (no allocation).
-    pub fn cmp(&self, a: u64, b: u64) -> std::cmp::Ordering {
+    fn cmp(&self, a: u64, b: u64) -> std::cmp::Ordering {
         if (a | b) & FALLBACK == 0 {
             return a.cmp(&b);
         }
         let (mut x, mut y) = ([0u8; 12], [0u8; 12]);
         self.str_of(a, &mut x).cmp(self.str_of(b, &mut y))
     }
+}
+
+impl IdNames for LongNames {
+    #[inline]
+    fn long_str(&self, code: u64) -> Option<&[u8]> {
+        self.table.get(code)
+    }
+}
+
+/// The link IDs' strings plus every thread's own table, read in place: no
+/// merge is needed to look names up.
+pub struct NameView<'a> {
+    pub links: &'a LongNames,
+    pub locals: &'a [LocalIds],
+}
+
+impl IdNames for NameView<'_> {
+    #[inline]
+    fn long_str(&self, code: u64) -> Option<&[u8]> {
+        self.links.table.get(code).or_else(|| self.locals.iter().find_map(|l| l.table.get(code)))
+    }
+}
+
+/// True if some code names two different strings anywhere: within a thread
+/// (fingerprints) or across the link table and the threads (bytes).
+pub fn any_collision(links: &LongNames, locals: &[LocalIds]) -> bool {
+    if links.collision || locals.iter().any(|l| l.collision) {
+        return true;
+    }
+    let mut seen = StrTable::default();
+    for l in locals {
+        for (c, fp, s) in l.table.entries() {
+            let ok = match links.table.get(c) {
+                Some(t) => t == s,
+                None => seen.insert(c, fp, s),
+            };
+            if !ok {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]

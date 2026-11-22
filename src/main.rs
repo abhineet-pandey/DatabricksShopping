@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use arena::{Arena, BlockList, ZTable};
-use ids::{LocalIds, LongNames};
+use ids::{IdNames, LocalIds, LongNames, NameView};
 use timeparse::{fast_iso_secs, fast_ts, parse_price, DAY_MS};
 
 #[global_allocator]
@@ -658,7 +658,7 @@ fn process_partition(
     cl_parts: &[Vec<BlockList<Cl>>],
     s: &mut Scratch,
     agg: &Agg,
-    names: &LongNames,
+    names: &NameView,
     camp: &mut [[i64; 4]],
     rows: &mut UserRows,
 ) {
@@ -1318,14 +1318,14 @@ fn main() {
     drop(link_ids);
     // The per-thread string tables are merged beside phase 3; only phase 4
     // needs the names.
-    let mut names_acc = long_names.into_inner().unwrap().unwrap();
-    let names_job = std::thread::spawn(move || {
-        for l in &local_ids {
-            names_acc.merge(l);
-        }
-        drop(local_ids);
-        names_acc
-    });
+    // Names are read from the link table and the per-thread tables in place;
+    // the cross-thread collision check runs beside phases 3 and 4.
+    let link_names = std::sync::Arc::new(long_names.into_inner().unwrap().unwrap());
+    let local_ids = std::sync::Arc::new(local_ids);
+    let collision_job = {
+        let (g, l) = (link_names.clone(), local_ids.clone());
+        std::thread::spawn(move || ids::any_collision(&g, &l))
+    };
     let eid_collision = std::sync::atomic::AtomicBool::new(false);
     timer.mark("events+clicks parsed");
 
@@ -1463,10 +1463,7 @@ fn main() {
     timer.mark("dedup+route");
 
     // ---- phase 4: sessions per person
-    let names = names_job.join().unwrap();
-    if names.collision || eid_collision.load(Ordering::Relaxed) {
-        restart_on_collision(id_seed);
-    }
+    let names = NameView { links: &link_names, locals: &local_ids };
     let ncat = cat_names.len();
     let agg = Agg { ndays, ncat, day0, base, organic };
     // Largest partitions first: one holding a whale or a shared-device person
@@ -1525,6 +1522,11 @@ fn main() {
         drop(route_arenas);
         drop(click_arenas);
     });
+    // SS_TEST_COLLISION exercises the restart path (tests only).
+    let forced = id_seed == 0 && std::env::var_os("SS_TEST_COLLISION").is_some();
+    if collision_job.join().unwrap() || eid_collision.load(Ordering::Relaxed) || forced {
+        restart_on_collision(id_seed);
+    }
     timer.mark("sessions");
 
     // ---- phase 5: write
@@ -1611,7 +1613,7 @@ fn restart_on_collision(seed: u64) -> ! {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn write_user(path: &Path, rows: UserRows, names: &LongNames, cat_names: &[Vec<u8>]) {
+fn write_user(path: &Path, rows: UserRows, names: &NameView, cat_names: &[Vec<u8>]) {
     let n = rows.person.len();
     let mut ids = Vec::with_capacity(n * 14);
     let mut tmp = Vec::with_capacity(32);
