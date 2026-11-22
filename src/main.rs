@@ -156,6 +156,7 @@ struct Ev {
 struct ClickRaw {
     user: u64,
     kid: u64,
+    kord: u64, // see `click_order`
     ts: u32,
     camp: u32,
 }
@@ -165,8 +166,23 @@ struct ClickRaw {
 struct Cl {
     person: u64,
     kid: u64,
+    kord: u64,
     key: u64, // ts << 32 | camp
 }
+
+/// Click IDs only break ties between a person's clicks at the same
+/// millisecond, so their strings are not kept: the first 8 bytes, big-endian
+/// and zero-padded, order two IDs exactly unless they are equal. Equal keys
+/// of different clicks set `KID_AMBIGUOUS`, and the run restarts keeping the
+/// strings (`SS_KID_STRINGS`).
+#[inline(always)]
+fn click_order(s: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = s.len().min(8);
+    b[..n].copy_from_slice(&s[..n]);
+    u64::from_be_bytes(b)
+}
+static KID_AMBIGUOUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct Ctx {
     w0: i64,
@@ -177,6 +193,7 @@ struct Ctx {
     campaigns: Dim,
     pbits: u32,
     unknown_cat: u32,
+    kid_strings: bool,
 }
 
 impl Ctx {
@@ -254,9 +271,11 @@ fn parse_clicks(buf: &[u8], ctx: &Ctx, out: &mut Vec<ClickRaw>, ids: &mut LocalI
             Some(t) if t >= lo && t < hi => t,
             _ => return,
         };
+        let (kid, kord) = if ctx.kid_strings { (ids.code(f[0]), 0) } else { (ids.event_code(f[0]).0, click_order(f[0])) };
         out.push(ClickRaw {
             user: ids.code(f[1]),
-            kid: ids.code(f[0]),
+            kid,
+            kord,
             ts: (ts - base) as u32,
             camp,
         });
@@ -617,7 +636,7 @@ struct Scratch {
     ccount: Vec<u32>,
     coff: Vec<u32>,
     evs: Vec<u64>,
-    cls: Vec<(u64, u64)>,
+    cls: Vec<(u64, u64, u64)>, // (ts << 32 | camp, click code, click order key)
     // per person
     day_sessions: Vec<i64>,
     day_events: Vec<i64>,
@@ -645,6 +664,7 @@ struct Agg {
     day0: i64,
     base: i64,
     organic: u32,
+    kid_strings: bool,
 }
 
 #[inline(always)]
@@ -772,7 +792,7 @@ fn process_partition(
     }
     s.coff.push(acc);
     s.cls.clear();
-    s.cls.resize(nc, (0, 0));
+    s.cls.resize(nc, (0, 0, 0));
     if nc > 0 {
         let mut cur: Vec<u32> = s.coff[..np].to_vec();
         for p in cl_parts {
@@ -780,7 +800,7 @@ fn process_partition(
                 if let Some(id) = find(&s.table, c.person) {
                     let at = cur[id];
                     cur[id] = at + 1;
-                    s.cls[at as usize] = (c.key, c.kid);
+                    s.cls[at as usize] = (c.key, c.kid, c.kord);
                 }
             }
         }
@@ -797,7 +817,7 @@ fn process_partition(
         if cls.len() > 1 {
             cls.sort_unstable_by_key(|c| c.0);
         }
-        let cls: &[(u64, u64)] = cls;
+        let cls: &[(u64, u64, u64)] = cls;
         let evs: &[u64] = evs;
         let person = s.persons[pi];
 
@@ -887,7 +907,16 @@ fn process_partition(
                     let mut j = r - 1;
                     while j > l && ev_ts(cls[j - 1].0) == lt {
                         j -= 1;
-                        if names.cmp(cls[j].1, cls[best].1) == std::cmp::Ordering::Less {
+                        let (a, b) = (cls[j], cls[best]);
+                        let less = if agg.kid_strings {
+                            names.cmp(a.1, b.1) == std::cmp::Ordering::Less
+                        } else {
+                            if a.2 == b.2 && a.1 != b.1 {
+                                KID_AMBIGUOUS.store(true, Ordering::Relaxed);
+                            }
+                            a.2 < b.2
+                        };
+                        if less {
                             best = j;
                         }
                     }
@@ -1189,6 +1218,7 @@ fn main() {
     // Seed of the long-ID hash; a run that finds a hash collision restarts
     // itself with the next seed (see `restart_on_collision`).
     let id_seed: u64 = std::env::var("SS_ID_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let kid_strings = std::env::var_os("SS_KID_STRINGS").is_some();
     let pbits: u32 = std::env::var("SS_PBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     let nparts = 1usize << pbits;
     let ctx = Ctx {
@@ -1200,6 +1230,7 @@ fn main() {
         campaigns,
         pbits,
         unknown_cat: unknown_rank,
+        kid_strings,
     };
 
     // ---- files
@@ -1288,6 +1319,7 @@ fn main() {
                     unsafe { clp.get_unchecked_mut(hp(person, qbits)) }.push(&mut carena, Cl {
                         person,
                         kid: c.kid,
+                        kord: c.kord,
                         key: ((c.ts as u64) << 32) | c.camp as u64,
                     });
                 }
@@ -1465,7 +1497,7 @@ fn main() {
     // ---- phase 4: sessions per person
     let names = NameView { links: &link_names, locals: &local_ids };
     let ncat = cat_names.len();
-    let agg = Agg { ndays, ncat, day0, base, organic };
+    let agg = Agg { ndays, ncat, day0, base, organic, kid_strings };
     // Largest partitions first: one holding a whale or a shared-device person
     // then cannot be picked up last and hold up the whole phase.
     let mut order: Vec<(usize, u32)> = (0..nq)
@@ -1526,6 +1558,9 @@ fn main() {
     let forced = id_seed == 0 && std::env::var_os("SS_TEST_COLLISION").is_some();
     if collision_job.join().unwrap() || eid_collision.load(Ordering::Relaxed) || forced {
         restart_on_collision(id_seed);
+    }
+    if KID_AMBIGUOUS.load(Ordering::Relaxed) || (!kid_strings && std::env::var_os("SS_TEST_KID").is_some()) {
+        restart_with(&[("SS_KID_STRINGS", "1".to_string())], "click IDs share their first 8 bytes");
     }
     timer.mark("sessions");
 
@@ -1602,12 +1637,19 @@ fn main() {
 /// nothing has been written yet, so run again with another hash seed.
 #[cold]
 fn restart_on_collision(seed: u64) -> ! {
-    eprintln!("long-ID hash collision with seed {seed}; restarting with seed {}", seed + 1);
     assert!(seed < 16, "hash collisions with 16 seeds");
+    restart_with(&[("SS_ID_SEED", (seed + 1).to_string())], "long-ID hash collision")
+}
+
+/// Runs this program again with extra environment and exits with its status.
+/// Called before any output is written.
+#[cold]
+fn restart_with(env: &[(&str, String)], why: &str) -> ! {
+    eprintln!("{why}: restarting with {env:?}");
     let exe = std::env::current_exe().expect("current_exe");
     let status = std::process::Command::new(exe)
         .args(std::env::args_os().skip(1))
-        .env("SS_ID_SEED", (seed + 1).to_string())
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .status()
         .expect("restart");
     std::process::exit(status.code().unwrap_or(1));
