@@ -166,8 +166,10 @@ pub fn long_code(h1: u64) -> u64 {
     FALLBACK | (h1 >> 1)
 }
 
-/// Open-addressing string table keyed by long codes: (code, offset, length)
-/// slots over one byte arena. No locks: one per thread, merged afterwards.
+/// Open-addressing string table keyed by long codes over one byte arena.
+/// A slot is (code, second fingerprint, offset); the arena holds each string
+/// as a length byte pair (u16) followed by the bytes. No locks: one table per
+/// thread, merged afterwards.
 #[derive(Default)]
 pub struct StrTable {
     slots: Vec<(u64, u32, u32)>,
@@ -177,58 +179,73 @@ pub struct StrTable {
 
 impl StrTable {
     #[inline(always)]
-    fn mask(&self) -> usize {
-        self.slots.len() - 1
+    fn home(&self, code: u64) -> usize {
+        (code.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & (self.slots.len() - 1)
     }
     fn grow(&mut self) {
-        let cap = (self.slots.len() * 2).max(1024);
+        let cap = (self.slots.len() * 2).max(1 << 12);
         let old = std::mem::replace(&mut self.slots, vec![(0, 0, 0); cap]);
-        let m = cap - 1;
         for e in old {
             if e.0 != 0 {
-                let mut i = (e.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & m;
+                let mut i = self.home(e.0);
                 while self.slots[i].0 != 0 {
-                    i = (i + 1) & m;
+                    i = (i + 1) & (cap - 1);
                 }
                 self.slots[i] = e;
             }
         }
     }
-    /// Inserts `s` under `code` unless present. Returns false when `code`
-    /// already names a different string (a hash collision).
+    #[inline(always)]
+    fn at(&self, off: u32) -> &[u8] {
+        let o = off as usize;
+        let n = u16::from_le_bytes([self.bytes[o], self.bytes[o + 1]]) as usize;
+        &self.bytes[o + 2..o + 2 + n]
+    }
+    /// Inserts `s` under (`code`, `fp`) unless `code` is present. Returns
+    /// false when `code` is present with another fingerprint (a collision).
     #[inline]
-    pub fn insert(&mut self, code: u64, s: &[u8]) -> bool {
+    pub fn insert_fp(&mut self, code: u64, fp: u32, s: &[u8]) -> bool {
         if self.n * 2 >= self.slots.len() {
             self.grow();
         }
-        let m = self.mask();
-        let mut i = (code.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & m;
+        let m = self.slots.len() - 1;
+        let mut i = self.home(code);
         loop {
             let e = unsafe { *self.slots.get_unchecked(i) };
             if e.0 == code {
-                return &self.bytes[e.1 as usize..(e.1 + e.2) as usize] == s;
+                return e.1 == fp;
             }
             if e.0 == 0 {
                 let off = self.bytes.len() as u32;
-                self.bytes.extend_from_slice(s);
-                self.slots[i] = (code, off, s.len() as u32);
+                let n = s.len().min(u16::MAX as usize);
+                self.bytes.extend_from_slice(&(n as u16).to_le_bytes());
+                self.bytes.extend_from_slice(&s[..n]);
+                self.slots[i] = (code, fp, off);
                 self.n += 1;
-                return true;
+                return n == s.len();
             }
             i = (i + 1) & m;
         }
+    }
+    /// Inserts `s` unless present; false when `code` names another string
+    /// (compared byte by byte).
+    pub fn insert(&mut self, code: u64, fp: u32, s: &[u8]) -> bool {
+        if let Some(t) = self.get(code) {
+            return t == s;
+        }
+        self.insert_fp(code, fp, s)
     }
     #[inline]
     pub fn get(&self, code: u64) -> Option<&[u8]> {
         if self.slots.is_empty() {
             return None;
         }
-        let m = self.mask();
-        let mut i = (code.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & m;
+        let m = self.slots.len() - 1;
+        let mut i = self.home(code);
         loop {
             let e = unsafe { *self.slots.get_unchecked(i) };
             if e.0 == code {
-                return Some(&self.bytes[e.1 as usize..(e.1 + e.2) as usize]);
+                return Some(self.at(e.2));
             }
             if e.0 == 0 {
                 return None;
@@ -239,14 +256,16 @@ impl StrTable {
     pub fn len(&self) -> usize {
         self.n
     }
-    /// Every (code, string) entry.
-    pub fn entries(&self) -> impl Iterator<Item = (u64, &[u8])> + '_ {
-        self.slots.iter().filter(|e| e.0 != 0).map(move |e| (e.0, &self.bytes[e.1 as usize..(e.1 + e.2) as usize]))
+    /// Every (code, fingerprint, string) entry.
+    pub fn entries(&self) -> impl Iterator<Item = (u64, u32, &[u8])> + '_ {
+        self.slots.iter().filter(|e| e.0 != 0).map(move |e| (e.0, e.1, self.at(e.2)))
     }
 }
 
 /// Per-thread ID coder: fast codes when possible, otherwise long codes whose
 /// strings are kept (user, click and link IDs: names and tie-breaks need them).
+/// Within a thread a repeated code is checked by a second 32-bit fingerprint;
+/// across threads, by the bytes.
 pub struct LocalIds {
     pub seed: u64,
     pub table: StrTable,
@@ -266,8 +285,9 @@ impl LocalIds {
     }
     #[inline(never)]
     fn long(&mut self, s: &[u8]) -> u64 {
-        let c = long_code(hash2(s, self.seed).0);
-        if !self.table.insert(c, s) {
+        let (h1, h2) = hash2(s, self.seed);
+        let c = long_code(h1);
+        if !self.table.insert_fp(c, (h2 >> 32) as u32, s) {
             self.collision = true;
         }
         c
@@ -296,8 +316,8 @@ pub struct LongNames {
 impl LongNames {
     pub fn merge(&mut self, l: &LocalIds) {
         self.collision |= l.collision;
-        for (c, s) in l.table.entries() {
-            if !self.table.insert(c, s) {
+        for (c, fp, s) in l.table.entries() {
+            if !self.table.insert(c, fp, s) {
                 self.collision = true;
             }
         }
@@ -380,11 +400,12 @@ mod tests {
         assert_eq!(g.cmp(u, fast_code(b"a").unwrap()), std::cmp::Ordering::Less);
         // a forced collision: same code, different string
         let mut t = StrTable::default();
-        assert!(t.insert(FALLBACK | 5, b"x"));
-        assert!(t.insert(FALLBACK | 5, b"x"));
-        assert!(!t.insert(FALLBACK | 5, b"y"));
+        assert!(t.insert(FALLBACK | 5, 1, b"x"));
+        assert!(t.insert(FALLBACK | 5, 1, b"x"));
+        assert!(!t.insert(FALLBACK | 5, 1, b"y"));
+        assert!(!t.insert_fp(FALLBACK | 5, 2, b"x"));
         for i in 0..100_000u64 {
-            assert!(t.insert(FALLBACK | (i + 10), format!("id{i}").as_bytes()));
+            assert!(t.insert(FALLBACK | (i + 10), 0, format!("id{i}").as_bytes()));
         }
         assert_eq!(t.get(FALLBACK | 99), Some(&b"id89"[..]));
     }
