@@ -3,11 +3,10 @@
 //! A string of 1..=12 bytes from `[0-9a-z]` maps to `sum (v(c_i)+1) * 37^(11-i)`
 //! with `v('0')=0 .. v('z')=35` and the missing tail padded with 0. The map is
 //! injective, the codes are below 2^63, and integer order equals byte order of
-//! the strings. Any other string is interned and gets `FALLBACK | index`. Codes
-//! are never 0, so 0 can mark an empty hash slot.
-
-use std::collections::HashMap;
-use std::sync::Mutex;
+//! the strings. Any other string (in v5 data, one ID in eight has a 32-char
+//! hex suffix) gets `FALLBACK | 63 hash bits`, with its string kept in a
+//! per-thread table; collisions are detected. Codes are never 0, so 0 can
+//! mark an empty hash slot.
 
 pub const FALLBACK: u64 = 1 << 63;
 
@@ -123,83 +122,220 @@ pub fn decode_fast(mut code: u64, out: &mut Vec<u8>) {
     }
 }
 
-#[derive(Default)]
-pub struct InternerInner {
-    map: HashMap<Box<[u8]>, u64>,
-    pub strings: Vec<Box<[u8]>>,
+// ---------------------------------------------------------------- opaque IDs
+
+/// Folded 64x64 -> 128 multiply.
+#[inline(always)]
+fn mum(a: u64, b: u64) -> u64 {
+    let r = (a as u128) * (b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
 }
 
-#[derive(Default)]
-pub struct Interner {
-    pub inner: Mutex<InternerInner>,
-}
-
-impl Interner {
-    #[cold]
-    pub fn intern(&self, s: &[u8]) -> u64 {
-        let mut g = self.inner.lock().unwrap();
-        if let Some(&c) = g.map.get(s) {
-            return c;
-        }
-        let c = FALLBACK | g.strings.len() as u64;
-        g.strings.push(s.into());
-        g.map.insert(s.into(), c);
-        c
+/// Two independent 64-bit hashes of `s` (keyed by `seed`).
+#[inline]
+pub fn hash2(s: &[u8], seed: u64) -> (u64, u64) {
+    const K1: u64 = 0xa076_1d64_78bd_642f;
+    const K2: u64 = 0xe703_7ed1_a0b4_28db;
+    const K3: u64 = 0x8ebc_6af0_9c88_c6e3;
+    const K4: u64 = 0x5899_65cc_7537_4cc3;
+    let n = s.len() as u64;
+    let mut a = seed ^ K1 ^ n;
+    let mut b = seed.rotate_left(32) ^ K2 ^ n.wrapping_mul(K3);
+    let mut c = s.chunks_exact(8);
+    for w in &mut c {
+        let w = u64::from_le_bytes(w.try_into().unwrap());
+        a = mum(a ^ w, K3);
+        b = mum(b ^ w.rotate_left(29), K4);
     }
+    let r = c.remainder();
+    if !r.is_empty() {
+        let mut t = [0u8; 8];
+        t[..r.len()].copy_from_slice(r);
+        let w = u64::from_le_bytes(t);
+        a = mum(a ^ w, K3);
+        b = mum(b ^ w.rotate_left(29), K4);
+    }
+    (mum(a ^ K2, K1 ^ n), mum(b ^ K1, K2 ^ n.rotate_left(17)))
+}
 
+/// Code of an ID that has no exact fast code: `FALLBACK` | 63 hash bits.
+/// Distinct strings with equal codes are detected (see `LocalIds` and
+/// `LongNames::merge`), and the run then restarts with another seed.
+#[inline(always)]
+pub fn long_code(h1: u64) -> u64 {
+    FALLBACK | (h1 >> 1)
+}
+
+/// Open-addressing string table keyed by long codes: (code, offset, length)
+/// slots over one byte arena. No locks: one per thread, merged afterwards.
+#[derive(Default)]
+pub struct StrTable {
+    slots: Vec<(u64, u32, u32)>,
+    n: usize,
+    bytes: Vec<u8>,
+}
+
+impl StrTable {
     #[inline(always)]
-    pub fn code(&self, s: &[u8]) -> u64 {
+    fn mask(&self) -> usize {
+        self.slots.len() - 1
+    }
+    fn grow(&mut self) {
+        let cap = (self.slots.len() * 2).max(1024);
+        let old = std::mem::replace(&mut self.slots, vec![(0, 0, 0); cap]);
+        let m = cap - 1;
+        for e in old {
+            if e.0 != 0 {
+                let mut i = (e.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & m;
+                while self.slots[i].0 != 0 {
+                    i = (i + 1) & m;
+                }
+                self.slots[i] = e;
+            }
+        }
+    }
+    /// Inserts `s` under `code` unless present. Returns false when `code`
+    /// already names a different string (a hash collision).
+    #[inline]
+    pub fn insert(&mut self, code: u64, s: &[u8]) -> bool {
+        if self.n * 2 >= self.slots.len() {
+            self.grow();
+        }
+        let m = self.mask();
+        let mut i = (code.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & m;
+        loop {
+            let e = unsafe { *self.slots.get_unchecked(i) };
+            if e.0 == code {
+                return &self.bytes[e.1 as usize..(e.1 + e.2) as usize] == s;
+            }
+            if e.0 == 0 {
+                let off = self.bytes.len() as u32;
+                self.bytes.extend_from_slice(s);
+                self.slots[i] = (code, off, s.len() as u32);
+                self.n += 1;
+                return true;
+            }
+            i = (i + 1) & m;
+        }
+    }
+    #[inline]
+    pub fn get(&self, code: u64) -> Option<&[u8]> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let m = self.mask();
+        let mut i = (code.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & m;
+        loop {
+            let e = unsafe { *self.slots.get_unchecked(i) };
+            if e.0 == code {
+                return Some(&self.bytes[e.1 as usize..(e.1 + e.2) as usize]);
+            }
+            if e.0 == 0 {
+                return None;
+            }
+            i = (i + 1) & m;
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.n
+    }
+    /// Every (code, string) entry.
+    pub fn entries(&self) -> impl Iterator<Item = (u64, &[u8])> + '_ {
+        self.slots.iter().filter(|e| e.0 != 0).map(move |e| (e.0, &self.bytes[e.1 as usize..(e.1 + e.2) as usize]))
+    }
+}
+
+/// Per-thread ID coder: fast codes when possible, otherwise long codes whose
+/// strings are kept (user, click and link IDs: names and tie-breaks need them).
+pub struct LocalIds {
+    pub seed: u64,
+    pub table: StrTable,
+    pub collision: bool,
+}
+
+impl LocalIds {
+    pub fn new(seed: u64) -> Self {
+        LocalIds { seed, table: StrTable::default(), collision: false }
+    }
+    #[inline(always)]
+    pub fn code(&mut self, s: &[u8]) -> u64 {
         match fast_code(s) {
             Some(c) => c,
-            None => self.intern(s),
+            None => self.long(s),
         }
     }
-
-    pub fn bytes_of(&self, code: u64, out: &mut Vec<u8>) {
-        if code & FALLBACK == 0 {
-            decode_fast(code, out);
-        } else {
-            let g = self.inner.lock().unwrap();
-            out.extend_from_slice(&g.strings[(code & !FALLBACK) as usize]);
+    #[inline(never)]
+    fn long(&mut self, s: &[u8]) -> u64 {
+        let c = long_code(hash2(s, self.seed).0);
+        if !self.table.insert(c, s) {
+            self.collision = true;
         }
+        c
     }
-
-    /// Byte-wise comparison of the strings behind two codes.
-    pub fn cmp(&self, a: u64, b: u64) -> std::cmp::Ordering {
-        if (a | b) & FALLBACK == 0 {
-            return a.cmp(&b);
+    /// Event IDs: no string is kept. Returns the code and a 31-bit second
+    /// fingerprint (0 for fast codes) that dedup compares when codes match.
+    #[inline(always)]
+    pub fn event_code(&self, s: &[u8]) -> (u64, u32) {
+        match fast_code(s) {
+            Some(c) => (c, 0),
+            None => {
+                let (h1, h2) = hash2(s, self.seed);
+                (long_code(h1), (h2 >> 33) as u32)
+            }
         }
-        let mut x = Vec::new();
-        let mut y = Vec::new();
-        self.bytes_of(a, &mut x);
-        self.bytes_of(b, &mut y);
-        x.cmp(&y)
     }
 }
 
-/// Read-only view after parsing finished.
-pub struct Names {
-    pub strings: Vec<Box<[u8]>>,
+/// The strings of all long codes, after the per-thread tables are merged.
+#[derive(Default)]
+pub struct LongNames {
+    pub table: StrTable,
+    pub collision: bool,
 }
 
-impl Names {
+impl LongNames {
+    pub fn merge(&mut self, l: &LocalIds) {
+        self.collision |= l.collision;
+        for (c, s) in l.table.entries() {
+            if !self.table.insert(c, s) {
+                self.collision = true;
+            }
+        }
+    }
     #[inline]
     pub fn bytes_of(&self, code: u64, out: &mut Vec<u8>) {
         if code & FALLBACK == 0 {
             decode_fast(code, out);
         } else {
-            out.extend_from_slice(&self.strings[(code & !FALLBACK) as usize]);
+            out.extend_from_slice(self.table.get(code).expect("long ID without its string"));
         }
     }
+    /// The string behind `code`; fast codes are decoded into `buf`.
+    #[inline]
+    fn str_of<'a>(&'a self, code: u64, buf: &'a mut [u8; 12]) -> &'a [u8] {
+        if code & FALLBACK != 0 {
+            return self.table.get(code).expect("long ID without its string");
+        }
+        let mut c = code;
+        let mut d = [0u8; 12];
+        for i in (0..12).rev() {
+            d[i] = (c % 37) as u8;
+            c /= 37;
+        }
+        let mut n = 0;
+        while n < 12 && d[n] != 0 {
+            buf[n] = DIGITS[(d[n] - 1) as usize];
+            n += 1;
+        }
+        &buf[..n]
+    }
+    /// Byte-wise comparison of the strings behind two codes (no allocation).
     pub fn cmp(&self, a: u64, b: u64) -> std::cmp::Ordering {
         if (a | b) & FALLBACK == 0 {
             return a.cmp(&b);
         }
-        let mut x = Vec::new();
-        let mut y = Vec::new();
-        self.bytes_of(a, &mut x);
-        self.bytes_of(b, &mut y);
-        x.cmp(&y)
+        let (mut x, mut y) = ([0u8; 12], [0u8; 12]);
+        self.str_of(a, &mut x).cmp(self.str_of(b, &mut y))
     }
 }
 
@@ -225,6 +361,32 @@ mod tests {
         assert!(fast_code(b" u1").is_none());
         assert!(fast_code(b"").is_none());
         assert!(fast_code(b"aaaaaaaaaaaaa").is_none());
+    }
+    #[test]
+    fn long_ids_roundtrip_and_detect_collisions() {
+        let mut l = LocalIds::new(7);
+        let a = l.code(b"u5786c0ad7acc294274177835cdbcc8aa");
+        let b = l.code(b"u5786c0ad7acc294274177835cdbcc8ab");
+        assert!(a & FALLBACK != 0 && b & FALLBACK != 0 && a != b);
+        assert_eq!(l.code(b"u5786c0ad7acc294274177835cdbcc8aa"), a);
+        assert_eq!(l.code(b"u1"), fast_code(b"u1").unwrap());
+        let u = l.code(b"U1");
+        let mut g = LongNames::default();
+        g.merge(&l);
+        assert!(!g.collision);
+        let mut o = Vec::new();
+        g.bytes_of(u, &mut o);
+        assert_eq!(&o[..], b"U1");
+        assert_eq!(g.cmp(u, fast_code(b"a").unwrap()), std::cmp::Ordering::Less);
+        // a forced collision: same code, different string
+        let mut t = StrTable::default();
+        assert!(t.insert(FALLBACK | 5, b"x"));
+        assert!(t.insert(FALLBACK | 5, b"x"));
+        assert!(!t.insert(FALLBACK | 5, b"y"));
+        for i in 0..100_000u64 {
+            assert!(t.insert(FALLBACK | (i + 10), format!("id{i}").as_bytes()));
+        }
+        assert_eq!(t.get(FALLBACK | 99), Some(&b"id89"[..]));
     }
     #[test]
     fn simd_matches_scalar() {

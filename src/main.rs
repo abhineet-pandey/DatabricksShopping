@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use arena::{Arena, BlockList, ZTable};
-use ids::{Interner, Names};
+use ids::{LocalIds, LongNames};
 use timeparse::{fast_iso_secs, fast_ts, parse_price, DAY_MS};
 
 #[global_allocator]
@@ -175,7 +175,6 @@ struct Ctx {
     ingest_base_secs: i64,
     products: Dim,
     campaigns: Dim,
-    interner: Interner,
     pbits: u32,
     unknown_cat: u32,
 }
@@ -191,15 +190,16 @@ impl Ctx {
 // ---------------------------------------------------------------- parsing
 
 #[inline(never)]
-fn parse_events(buf: &[u8], ctx: &Ctx, cands: &mut [BlockList<Cand>], arena: &mut Arena) {
+fn parse_events(buf: &[u8], ctx: &Ctx, cands: &mut [BlockList<Cand>], arena: &mut Arena, ids: &mut LocalIds) {
     let (w0, w1, base) = (ctx.w0, ctx.w1, ctx.base);
     csv::for_each_line_fast::<7, _>(buf, |f| {
         let e = f[0];
         if e.is_empty() {
             return;
         }
-        let eid = ctx.interner.code(e);
-        let mut c = Cand { eid, user: 0, ingest: u32::MAX, ts: 0, pc: 0, valid: 0 };
+        let (eid, fp) = ids.event_code(e);
+        // bit 0: valid; bits 1..: second fingerprint of a long event ID
+        let mut c = Cand { eid, user: 0, ingest: u32::MAX, ts: 0, pc: 0, valid: fp << 1 };
         if let Some(ing_s) = fast_iso_secs(f[3]) {
             c.ingest = ctx.ingest_key(ing_s);
             let ing = ing_s * 1000;
@@ -227,10 +227,10 @@ fn parse_events(buf: &[u8], ctx: &Ctx, cands: &mut [BlockList<Cand>], arena: &mu
                 } else {
                     break 'v;
                 };
-                c.user = ctx.interner.code(f[1]);
+                c.user = ids.code(f[1]);
                 c.ts = (ts - base) as u32;
                 c.pc = pc;
-                c.valid = 1;
+                c.valid |= 1;
             }
         }
         unsafe { cands.get_unchecked_mut(hp(eid, ctx.pbits)) }.push(arena, c);
@@ -238,7 +238,7 @@ fn parse_events(buf: &[u8], ctx: &Ctx, cands: &mut [BlockList<Cand>], arena: &mu
 }
 
 #[inline(never)]
-fn parse_clicks(buf: &[u8], ctx: &Ctx, out: &mut Vec<ClickRaw>) {
+fn parse_clicks(buf: &[u8], ctx: &Ctx, out: &mut Vec<ClickRaw>, ids: &mut LocalIds) {
     let lo = ctx.w0 - REACH_MS;
     let hi = ctx.w1;
     let base = ctx.base;
@@ -255,20 +255,20 @@ fn parse_clicks(buf: &[u8], ctx: &Ctx, out: &mut Vec<ClickRaw>) {
             _ => return,
         };
         out.push(ClickRaw {
-            user: ctx.interner.code(f[1]),
-            kid: ctx.interner.code(f[0]),
+            user: ids.code(f[1]),
+            kid: ids.code(f[0]),
             ts: (ts - base) as u32,
             camp,
         });
     });
 }
 
-fn parse_links(buf: &[u8], ctx: &Ctx, out: &mut Vec<(u64, u64)>) {
+fn parse_links(buf: &[u8], out: &mut Vec<(u64, u64)>, ids: &mut LocalIds) {
     csv::for_each_line_fast::<2, _>(buf, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        out.push((ctx.interner.code(f[0]), ctx.interner.code(f[1])));
+        out.push((ids.code(f[0]), ids.code(f[1])));
     });
 }
 
@@ -376,7 +376,7 @@ impl LinkMap {
 // Never inlined: inlined into the parse workers' closure, it made the hot
 // parse loop measurably slower.
 #[inline(never)]
-fn build_links(links: &[Vec<(u64, u64)>], names: &Interner) -> LinkMap {
+fn build_links(links: &[Vec<(u64, u64)>], names: &LongNames) -> LinkMap {
     let n_edges: usize = links.iter().map(|l| l.len()).sum();
     build_links_from(links, names, bits_for(n_edges + n_edges / 3))
 }
@@ -388,7 +388,7 @@ fn bits_for(n: usize) -> u32 {
 
 /// `build_links` starting from a table of `init_bits` bits (tests start small
 /// to exercise growth).
-fn build_links_from(links: &[Vec<(u64, u64)>], names: &Interner, init_bits: u32) -> LinkMap {
+fn build_links_from(links: &[Vec<(u64, u64)>], names: &LongNames, init_bits: u32) -> LinkMap {
     const AHEAD: usize = 8;
     /// A table of `node_code[id] -> id` with `bits` bits, and its part fills.
     fn rehash(node_code: &[u64], bits: u32) -> (LinkMap, Vec<u32>) {
@@ -658,7 +658,7 @@ fn process_partition(
     cl_parts: &[Vec<BlockList<Cl>>],
     s: &mut Scratch,
     agg: &Agg,
-    names: &Names,
+    names: &LongNames,
     camp: &mut [[i64; 4]],
     rows: &mut UserRows,
 ) {
@@ -1186,6 +1186,9 @@ fn main() {
     camp_ids.push(b"organic".to_vec());
     camp_channels.push(b"organic".to_vec());
 
+    // Seed of the long-ID hash; a run that finds a hash collision restarts
+    // itself with the next seed (see `restart_on_collision`).
+    let id_seed: u64 = std::env::var("SS_ID_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let pbits: u32 = std::env::var("SS_PBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     let nparts = 1usize << pbits;
     let ctx = Ctx {
@@ -1195,7 +1198,6 @@ fn main() {
         ingest_base_secs: w0.div_euclid(1000),
         products,
         campaigns,
-        interner: Interner::default(),
         pbits,
         unknown_cat: unknown_rank,
     };
@@ -1213,16 +1215,19 @@ fn main() {
 
     // ---- phase 1: links
     let next = AtomicUsize::new(0);
-    let links: Vec<Vec<(u64, u64)>> = run_parallel(threads, |_| {
+    let (links, link_ids): (Vec<Vec<(u64, u64)>>, Vec<LocalIds>) = run_parallel(threads, |_| {
         let mut out = Vec::new();
         let mut buf = Vec::new();
+        let mut ids = LocalIds::new(id_seed);
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(c) = link_chunks.get(i) else { break };
-            parse_links(load_chunk(&input, c, &mut buf), &ctx, &mut out);
+            parse_links(load_chunk(&input, c, &mut buf), &mut out, &mut ids);
         }
-        out
-    });
+        (out, ids)
+    })
+    .into_iter()
+    .unzip();
     timer.mark("links parsed");
 
     // ---- phase 2: events + clicks (thread 0 builds the link map first)
@@ -1234,12 +1239,21 @@ fn main() {
     // them the map is (almost always) ready, and clicks go straight to their
     // person partition.
     let lm_cell: std::sync::OnceLock<LinkMap> = std::sync::OnceLock::new();
-    let parsed: Vec<(Vec<BlockList<Cand>>, Arena, Vec<BlockList<Cl>>, Arena)> = run_parallel(threads, |t| {
+    // strings of the long IDs seen so far (links first: the link map needs them)
+    let long_names: std::sync::Mutex<Option<LongNames>> = std::sync::Mutex::new(None);
+    #[allow(clippy::type_complexity)]
+    let parsed: Vec<(Vec<BlockList<Cand>>, Arena, Vec<BlockList<Cl>>, Arena, LocalIds)> = run_parallel(threads, |t| {
         if t == 0 {
-            let m = build_links(&links, &ctx.interner);
+            let mut g = LongNames::default();
+            for l in &link_ids {
+                g.merge(l);
+            }
+            let m = build_links(&links, &g);
+            *long_names.lock().unwrap() = Some(g);
             let _ = lm_cell.set(m);
             timer.mark("link map built");
         }
+        let mut ids = LocalIds::new(id_seed);
         let mut arena = Arena::new();
         let mut cands: Vec<BlockList<Cand>> = (0..nparts).map(|_| BlockList::new()).collect();
         let mut carena = Arena::new();
@@ -1251,10 +1265,10 @@ fn main() {
             let Some(c) = work_chunks.get(i) else { break };
             let buf = load_chunk(&input, c, &mut cbuf);
             if c.kind == 1 {
-                parse_events(buf, &ctx, &mut cands, &mut arena);
+                parse_events(buf, &ctx, &mut cands, &mut arena, &mut ids);
             } else {
                 clicks.clear();
-                parse_clicks(buf, &ctx, &mut clicks);
+                parse_clicks(buf, &ctx, &mut clicks, &mut ids);
                 let lm = loop {
                     if let Some(m) = lm_cell.get() {
                         break m;
@@ -1285,20 +1299,34 @@ fn main() {
         for l in clp.iter_mut() {
             l.finish(&mut carena);
         }
-        (cands, arena, clp, carena)
+        (cands, arena, clp, carena, ids)
     });
     let mut cand_parts: Vec<Vec<BlockList<Cand>>> = Vec::with_capacity(threads);
     let mut cand_arenas: Vec<Arena> = Vec::with_capacity(threads);
     let mut cl_parts: Vec<Vec<BlockList<Cl>>> = Vec::with_capacity(threads);
     let mut click_arenas: Vec<Arena> = Vec::with_capacity(threads);
-    for (c, a, k, ka) in parsed {
+    let mut local_ids = Vec::with_capacity(threads);
+    for (c, a, k, ka, ids) in parsed {
         cand_parts.push(c);
         cand_arenas.push(a);
         cl_parts.push(k);
         click_arenas.push(ka);
+        local_ids.push(ids);
     }
     let linkmap = lm_cell.into_inner().unwrap();
     drop(links);
+    drop(link_ids);
+    // The per-thread string tables are merged beside phase 3; only phase 4
+    // needs the names.
+    let mut names_acc = long_names.into_inner().unwrap().unwrap();
+    let names_job = std::thread::spawn(move || {
+        for l in &local_ids {
+            names_acc.merge(l);
+        }
+        drop(local_ids);
+        names_acc
+    });
+    let eid_collision = std::sync::atomic::AtomicBool::new(false);
     timer.mark("events+clicks parsed");
 
     // ---- phase 3: dedup events, map persons, partition by person
@@ -1371,8 +1399,12 @@ fn main() {
                                 }
                                 if *e & !0xFFFF_FFFF == fp {
                                     let op = cand_at(&bptrs, *e as u32 - 1);
-                                    let (o_eid, o_ingest) = unsafe { ((*op).eid, (*op).ingest) };
+                                    let (o_eid, o_ingest, o_valid) = unsafe { ((*op).eid, (*op).ingest, (*op).valid) };
                                     if o_eid == c_eid {
+                                        if (o_valid ^ c.valid) >> 1 != 0 {
+                                            // equal 63-bit codes, different event IDs
+                                            eid_collision.store(true, Ordering::Relaxed);
+                                        }
                                         // The losing copy is marked invalid, so the
                                         // emit pass below reads candidates in order.
                                         let loser = if c_ingest < o_ingest {
@@ -1381,7 +1413,7 @@ fn main() {
                                         } else {
                                             unsafe { bp.add(off) }
                                         };
-                                        unsafe { (*loser).valid = 0 };
+                                        unsafe { (*loser).valid &= !1 };
                                         break;
                                     }
                                 }
@@ -1396,7 +1428,7 @@ fn main() {
                 // valid candidates in order.
                 for p in cand_parts.iter() {
                     for c in p[b].iter() {
-                        if c.valid == 0 {
+                        if c.valid & 1 == 0 {
                             continue;
                         }
                         batch.push((c.user, ((c.ts as u64) << 32) | c.pc as u64));
@@ -1431,10 +1463,10 @@ fn main() {
     timer.mark("dedup+route");
 
     // ---- phase 4: sessions per person
-    let names = {
-        let g = ctx.interner.inner.lock().unwrap();
-        Names { strings: g.strings.clone() }
-    };
+    let names = names_job.join().unwrap();
+    if names.collision || eid_collision.load(Ordering::Relaxed) {
+        restart_on_collision(id_seed);
+    }
     let ncat = cat_names.len();
     let agg = Agg { ndays, ncat, day0, base, organic };
     // Largest partitions first: one holding a whale or a shared-device person
@@ -1564,7 +1596,22 @@ fn main() {
     prof::dump();
 }
 
-fn write_user(path: &Path, rows: UserRows, names: &Names, cat_names: &[Vec<u8>]) {
+/// Two different IDs got the same 63-bit code (odds around 1e-6 per run):
+/// nothing has been written yet, so run again with another hash seed.
+#[cold]
+fn restart_on_collision(seed: u64) -> ! {
+    eprintln!("long-ID hash collision with seed {seed}; restarting with seed {}", seed + 1);
+    assert!(seed < 16, "hash collisions with 16 seeds");
+    let exe = std::env::current_exe().expect("current_exe");
+    let status = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("SS_ID_SEED", (seed + 1).to_string())
+        .status()
+        .expect("restart");
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn write_user(path: &Path, rows: UserRows, names: &LongNames, cat_names: &[Vec<u8>]) {
     let n = rows.person.len();
     let mut ids = Vec::with_capacity(n * 14);
     let mut tmp = Vec::with_capacity(32);
@@ -1627,7 +1674,7 @@ mod link_tests {
 
     #[test]
     fn build_links_matches_reference_and_grows() {
-        let names = Interner::default();
+        let names = LongNames::default();
         let mut x: u64 = 0x9E3779B97F4A7C15;
         let mut rnd = move || {
             x ^= x << 13;
