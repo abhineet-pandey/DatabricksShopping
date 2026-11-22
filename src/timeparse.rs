@@ -282,6 +282,7 @@ static YM: [i32; NY * 12 + 1] = ym_table();
 fn load8(s: &[u8], i: usize) -> u64 {
     u64::from_le_bytes(s[i..i + 8].try_into().unwrap())
 }
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 #[inline(always)]
 fn byte(x: u64, i: u32) -> i64 {
     ((x >> (8 * i)) & 0xFF) as i64
@@ -300,23 +301,74 @@ pub fn fast_iso_secs(s: &[u8]) -> Option<i64> {
     if n != 20 && n != 25 {
         return None;
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    let (y, mo, d, h, mi) = unsafe { iso16(s.as_ptr())? };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+    let (y, mo, d, h, mi) = swar16(s)?;
+    if s[16] != b':' {
+        return None;
+    }
+    let s1 = dig(s[17]) as i64;
+    let s2 = dig(s[18]) as i64;
+    if s1 > 9 || s2 > 9 {
+        return None;
+    }
+    let se = s1 * 10 + s2;
+    if se > 59 {
+        return None;
+    }
+    fast_iso_tail(s, n, y, mo, d, h, mi, se)
+}
+
+/// `YYYY-MM-DDThh:mm` from 16 bytes with SSE: separators checked, digits
+/// validated, pairs combined with one multiply-add; month, day, hour and
+/// minute range-checked. Returns (year, month, day, hour, minute).
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn iso16(p: *const u8) -> Option<(i64, i64, i64, i64, i64)> {
+    use std::arch::x86_64::*;
+    let v = _mm_loadu_si128(p as *const __m128i);
+    let tmpl = _mm_setr_epi8(48, 48, 48, 48, 45, 48, 48, 45, 48, 48, 84, 48, 48, 58, 48, 48);
+    // separators must equal the template (positions 4, 7, 10, 13)
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(v, tmpl)) & 0x2490 != 0x2490 {
+        return None;
+    }
+    // digits only: gather the 12 digit bytes into pairs, zero the rest
+    let g = _mm_shuffle_epi8(v, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+    let dg = _mm_sub_epi8(g, _mm_setr_epi8(48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 0, 0, 0, 0));
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(dg, _mm_set1_epi8(9)), dg)) != 0xFFFF {
+        return None;
+    }
+    // 16-bit lanes: YY(hi), YY(lo), MM, DD, hh, mm, 0, 0
+    let pr = _mm_maddubs_epi16(dg, _mm_set1_epi16(0x010A));
+    // ranges: MM in 1..=12, DD >= 1, hh <= 23, mm <= 59 (DD's upper bound is the month table's)
+    let lo = _mm_setr_epi16(-1, -1, 0, 0, -1, -1, -1, -1);
+    let hi = _mm_setr_epi16(100, 100, 13, 100, 24, 60, 1, 1);
+    let bad = _mm_or_si128(_mm_cmpgt_epi16(pr, _mm_sub_epi16(hi, _mm_set1_epi16(1))), _mm_cmpgt_epi16(_mm_add_epi16(lo, _mm_set1_epi16(1)), pr));
+    if _mm_movemask_epi8(bad) != 0 {
+        return None;
+    }
+    let q = _mm_cvtsi128_si64(pr) as u64;
+    let r = _mm_extract_epi64::<1>(pr) as u64;
+    let y = (q & 0xFFFF) as i64 * 100 + ((q >> 16) & 0xFFFF) as i64;
+    Some((y, ((q >> 32) & 0xFFFF) as i64, (q >> 48) as i64, (r & 0xFFFF) as i64, ((r >> 16) & 0xFFFF) as i64))
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+#[inline(always)]
+fn swar16(s: &[u8]) -> Option<(i64, i64, i64, i64, i64)> {
     let a = load8(s, 0); // YYYY-MM-
     let b = load8(s, 8); // DDThh:mm
     const AS: u64 = 0xFF00_00FF_0000_0000;
     const AV: u64 = (b'-' as u64) << 32 | (b'-' as u64) << 56;
     const BS: u64 = 0x0000_FF00_00FF_0000;
     const BV: u64 = (b'T' as u64) << 16 | (b':' as u64) << 40;
-    if (a & AS) != AV || (b & BS) != BV || s[16] != b':' {
+    if (a & AS) != AV || (b & BS) != BV {
         return None;
     }
     let ad = (a & !AS) | (0x30u64 << 32) | (0x30u64 << 56);
     let bd = (b & !BS) | (0x30u64 << 16) | (0x30u64 << 40);
     if !is_eight_digits(ad) || !is_eight_digits(bd) {
-        return None;
-    }
-    let s1 = dig(s[17]) as i64;
-    let s2 = dig(s[18]) as i64;
-    if s1 > 9 || s2 > 9 {
         return None;
     }
     let a0 = ad.wrapping_sub(0x3030_3030_3030_3030);
@@ -329,10 +381,15 @@ pub fn fast_iso_secs(s: &[u8]) -> Option<i64> {
     let d = byte(bp, 0);
     let h = byte(bp, 3);
     let mi = byte(bp, 6);
-    let se = s1 * 10 + s2;
-    if mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || se > 59 {
+    if mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 {
         return None;
     }
+    Some((y, mo, d, h, mi))
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn fast_iso_tail(s: &[u8], n: usize, y: i64, mo: i64, d: i64, h: i64, mi: i64, se: i64) -> Option<i64> {
     let yi = y - Y0;
     if yi < 0 || yi >= NY as i64 {
         return parse_iso(s).map(|ms| ms.div_euclid(1000));
