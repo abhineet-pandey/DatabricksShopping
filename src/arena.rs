@@ -58,6 +58,77 @@ impl Drop for Arena {
     }
 }
 
+/// A zero-filled table of `T` (all-zero bytes must be a valid `T`) in its own
+/// 2 MiB-aligned mapping marked for huge pages. A `Vec` of the same size can
+/// land on the malloc heap and fault in 4 KiB pages.
+pub struct ZTable<T: Copy> {
+    ptr: *mut T,
+    len: usize,
+    base: *mut u8,
+    bytes: usize,
+}
+
+unsafe impl<T: Copy + Send> Send for ZTable<T> {}
+unsafe impl<T: Copy + Sync> Sync for ZTable<T> {}
+
+impl<T: Copy> ZTable<T> {
+    pub fn new(len: usize) -> Self {
+        let need = (len * std::mem::size_of::<T>()).max(1);
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let bytes = need.next_multiple_of(ALIGN) + ALIGN;
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert!(p != libc::MAP_FAILED, "out of memory");
+            let base = p as *mut u8;
+            let aligned = (base as usize).next_multiple_of(ALIGN);
+            libc::madvise(aligned as *mut libc::c_void, need.next_multiple_of(ALIGN), libc::MADV_HUGEPAGE);
+            ZTable { ptr: aligned as *mut T, len, base, bytes }
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            let layout = Layout::from_size_align(need, 64).unwrap();
+            let base = std::alloc::alloc_zeroed(layout);
+            assert!(!base.is_null(), "out of memory");
+            ZTable { ptr: base as *mut T, len, base, bytes: need }
+        }
+    }
+}
+
+impl<T: Copy> Drop for ZTable<T> {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::munmap(self.base as *mut libc::c_void, self.bytes);
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            dealloc(self.base, Layout::from_size_align(self.bytes, 64).unwrap());
+        }
+    }
+}
+
+impl<T: Copy> std::ops::Deref for ZTable<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl<T: Copy> std::ops::DerefMut for ZTable<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
 /// An append-only list of `T` in arena blocks. The arena it was filled from
 /// must outlive every read, and `finish` must run before the first read.
 ///
@@ -170,6 +241,16 @@ impl<T: Copy> BlockList<T> {
             let len = if i + 1 == n { self.fill } else { Self::CAP };
             unsafe { std::slice::from_raw_parts(b as *const T, len) }
         })
+    }
+
+    /// The filled blocks as raw (pointer, length) pairs, in push order. The
+    /// pointers come straight from the arena, so a caller that owns the list's
+    /// contents exclusively may write through them.
+    #[inline]
+    pub fn raw_chunks(&self) -> impl Iterator<Item = (*mut T, usize)> + '_ {
+        debug_assert!(self.sfill == 0);
+        let n = self.blocks.len();
+        self.blocks.iter().enumerate().map(move |(i, &b)| (b, if i + 1 == n { self.fill } else { Self::CAP }))
     }
 
     #[inline]

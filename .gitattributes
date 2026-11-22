@@ -1,0 +1,3 @@
+# Fixture inputs and expected outputs are test data: keep their bytes exactly
+# (E20 relies on a "\r\n" line ending), never normalize line endings.
+fixtures/** -text

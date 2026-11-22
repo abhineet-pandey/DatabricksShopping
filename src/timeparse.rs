@@ -290,6 +290,12 @@ fn byte(x: u64, i: u32) -> i64 {
 /// Same results as `parse_iso`, with SWAR validation and a month table.
 #[inline(always)]
 pub fn fast_iso(s: &[u8]) -> Option<i64> {
+    fast_iso_secs(s).map(|x| x * 1000)
+}
+
+/// `fast_iso` in whole seconds (F1/F2 have no fraction).
+#[inline(always)]
+pub fn fast_iso_secs(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if n != 20 && n != 25 {
         return None;
@@ -315,18 +321,21 @@ pub fn fast_iso(s: &[u8]) -> Option<i64> {
     }
     let a0 = ad.wrapping_sub(0x3030_3030_3030_3030);
     let b0 = bd.wrapping_sub(0x3030_3030_3030_3030);
-    let y = byte(a0, 0) * 1000 + byte(a0, 1) * 100 + byte(a0, 2) * 10 + byte(a0, 3);
-    let mo = byte(a0, 5) * 10 + byte(a0, 6);
-    let d = byte(b0, 0) * 10 + byte(b0, 1);
-    let h = byte(b0, 3) * 10 + byte(b0, 4);
-    let mi = byte(b0, 6) * 10 + byte(b0, 7);
+    // byte k of a pair word = 10 * digit k + digit k+1 (each <= 99: no carry)
+    let ap = a0 * 10 + (a0 >> 8);
+    let bp = b0 * 10 + (b0 >> 8);
+    let y = byte(ap, 0) * 100 + byte(ap, 2);
+    let mo = byte(ap, 5);
+    let d = byte(bp, 0);
+    let h = byte(bp, 3);
+    let mi = byte(bp, 6);
     let se = s1 * 10 + s2;
     if mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || se > 59 {
         return None;
     }
     let yi = y - Y0;
     if yi < 0 || yi >= NY as i64 {
-        return parse_iso(s);
+        return parse_iso(s).map(|ms| ms.div_euclid(1000));
     }
     let i = (yi * 12 + mo - 1) as usize;
     let start = YM[i] as i64;
@@ -354,7 +363,7 @@ pub fn fast_iso(s: &[u8]) -> Option<i64> {
         }
         secs -= sign * (oh * 3600 + om * 60);
     }
-    Some(secs * 1000)
+    Some(secs)
 }
 
 /// Same results as `parse_ts`.

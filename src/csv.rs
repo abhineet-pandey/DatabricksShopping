@@ -199,6 +199,19 @@ unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
     }
 }
 
+/// Bits of `x` selected by `m`, packed low (BMI2 `pext` on both halves).
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+fn pext128(x: u128, m: u128) -> u32 {
+    use std::arch::x86_64::_pext_u64;
+    let ml = m as u64;
+    unsafe {
+        let lo = _pext_u64(x as u64, ml);
+        let hi = _pext_u64((x >> 64) as u64, (m >> 64) as u64);
+        (lo | hi.wrapping_shl(ml.count_ones())) as u32
+    }
+}
+
 /// Same contract as `for_each_line`, faster on lines up to 127 bytes: each
 /// line is split from one 128-byte window with straight-line code. A field is
 /// quoted when it starts and ends with `"` (2+ bytes); the line is clean when
@@ -250,6 +263,47 @@ pub fn for_each_line_fast<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a
         let mut fields: [&'a [u8]; N] = [&[]; N];
         let (mut clo, mut chi) = (c as u64, (c >> 64) as u64);
         let mut fs = 0usize;
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        {
+            // Quotes from masks alone. `starts` and `term` have one bit per
+            // field (its first byte, its terminator); `qs`/`qe` are quotes on a
+            // field's first/last byte. The line is clean iff every quote is one
+            // of those, no 1-byte field is a lone quote (qs & qe), and each
+            // field has both or neither; then bit i of `quoted` marks field i.
+            let starts = (c << 1) | 1;
+            let term = c | (1u128 << end);
+            let qs = q & starts;
+            let qe = q & (term >> 1);
+            let quoted = pext128(qs, starts);
+            if (qs | qe) != q || (qs & qe) != 0 || quoted != pext128(qe << 1, term) {
+                l = next;
+                continue;
+            }
+            let mut i = 0;
+            while i < N {
+                let fe = if i + 1 < N {
+                    if clo != 0 {
+                        let p = clo.trailing_zeros() as usize;
+                        clo &= clo - 1;
+                        p
+                    } else {
+                        let p = 64 + chi.trailing_zeros() as usize;
+                        chi &= chi.wrapping_sub(1);
+                        p
+                    }
+                } else {
+                    end
+                };
+                let qd = (quoted >> i) as usize & 1;
+                fields[i] = unsafe { std::slice::from_raw_parts(ptr.add(l + fs + qd), fe - fs - 2 * qd) };
+                fs = fe + 1;
+                i += 1;
+            }
+            cb(&fields);
+            l = next;
+            continue;
+        }
+        #[allow(unreachable_code)]
         let mut nq = 0u32;
         let lastb = len - 1;
         let mut i = 0;

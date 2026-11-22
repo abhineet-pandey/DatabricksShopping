@@ -4,3 +4,16 @@
 /dev
 /dev-answer
 *.parquet
+
+# Python caches (scripts/)
+__pycache__/
+*.pyc
+
+# profiling and editor leftovers
+perf.data*
+*.orig
+*.rej
+*.swp
+.DS_Store
+.vscode/
+.idea/
