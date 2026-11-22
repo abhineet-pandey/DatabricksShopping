@@ -252,6 +252,7 @@ fn parse_events(buf: &[u8], ctx: &Ctx, cands: &mut [BlockList<Cand>], arena: &mu
         }
         unsafe { cands.get_unchecked_mut(hp(eid, ctx.pbits)) }.push(arena, c);
     });
+    ids.flush(); // strings point into `buf`
 }
 
 #[inline(never)]
@@ -280,6 +281,7 @@ fn parse_clicks(buf: &[u8], ctx: &Ctx, out: &mut Vec<ClickRaw>, ids: &mut LocalI
             camp,
         });
     });
+    ids.flush(); // strings point into `buf`
 }
 
 fn parse_links(buf: &[u8], out: &mut Vec<(u64, u64)>, ids: &mut LocalIds) {
@@ -289,6 +291,7 @@ fn parse_links(buf: &[u8], out: &mut Vec<(u64, u64)>, ids: &mut LocalIds) {
         }
         out.push((ids.code(f[0]), ids.code(f[1])));
     });
+    ids.flush(); // strings point into `buf`
 }
 
 // ---------------------------------------------------------------- identity

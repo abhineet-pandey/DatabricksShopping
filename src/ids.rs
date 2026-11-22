@@ -195,6 +195,20 @@ impl StrTable {
             }
         }
     }
+    /// Makes room for `k` more entries without growing during the inserts.
+    pub fn reserve(&mut self, k: usize) {
+        while (self.n + k) * 2 >= self.slots.len() {
+            self.grow();
+        }
+    }
+    #[inline(always)]
+    pub fn prefetch(&self, code: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let p = self.slots.as_ptr().add(self.home(code));
+            std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
     #[inline(always)]
     fn at(&self, off: u32) -> &[u8] {
         let o = off as usize;
@@ -270,11 +284,21 @@ pub struct LocalIds {
     pub seed: u64,
     pub table: StrTable,
     pub collision: bool,
+    /// Inserts waiting for `flush`: (code, fingerprint, string). The strings
+    /// point into the caller's current input buffer, so `flush` must run
+    /// before that buffer changes. Batching lets the table probes overlap.
+    pending: Vec<(u64, u32, *const u8, usize)>,
 }
+
+// `pending` is empty whenever a LocalIds leaves its thread (after `flush`).
+unsafe impl Send for LocalIds {}
+unsafe impl Sync for LocalIds {}
+
+const BATCH: usize = 32;
 
 impl LocalIds {
     pub fn new(seed: u64) -> Self {
-        LocalIds { seed, table: StrTable::default(), collision: false }
+        LocalIds { seed, table: StrTable::default(), collision: false, pending: Vec::with_capacity(BATCH) }
     }
     #[inline(always)]
     pub fn code(&mut self, s: &[u8]) -> u64 {
@@ -287,10 +311,30 @@ impl LocalIds {
     fn long(&mut self, s: &[u8]) -> u64 {
         let (h1, h2) = hash2(s, self.seed);
         let c = long_code(h1);
-        if !self.table.insert_fp(c, (h2 >> 32) as u32, s) {
-            self.collision = true;
+        self.pending.push((c, (h2 >> 32) as u32, s.as_ptr(), s.len()));
+        if self.pending.len() == BATCH {
+            self.flush();
         }
         c
+    }
+    /// Performs the pending inserts. Must be called before the buffer that
+    /// the strings passed to `code` live in is changed or freed.
+    pub fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.table.reserve(self.pending.len());
+        for &(c, ..) in &self.pending {
+            self.table.prefetch(c);
+        }
+        for i in 0..self.pending.len() {
+            let (c, fp, p, n) = self.pending[i];
+            let s = unsafe { std::slice::from_raw_parts(p, n) };
+            if !self.table.insert_fp(c, fp, s) {
+                self.collision = true;
+            }
+        }
+        self.pending.clear();
     }
     /// Event IDs: no string is kept. Returns the code and a 31-bit second
     /// fingerprint (0 for fast codes) that dedup compares when codes match.
@@ -436,6 +480,7 @@ mod tests {
         assert_eq!(l.code(b"u5786c0ad7acc294274177835cdbcc8aa"), a);
         assert_eq!(l.code(b"u1"), fast_code(b"u1").unwrap());
         let u = l.code(b"U1");
+        l.flush();
         let mut g = LongNames::default();
         g.merge(&l);
         assert!(!g.collision);
